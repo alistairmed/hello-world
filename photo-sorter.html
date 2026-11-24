@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-Hant">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>相片自動分類器</title>
+<script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
+<style>
+:root{--side:#f2f2f5;--line:#e3e3e8;--ink:#1d1d1f;--mute:#86868b;--accent:#007aff}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;display:flex;font:13px -apple-system,BlinkMacSystemFont,"PingFang HK","Helvetica Neue",sans-serif;color:var(--ink);background:#fff;overflow:hidden}
+body.drag::after{content:"放開以匯入相片資料夾";position:fixed;inset:8px;border:3px dashed var(--accent);border-radius:14px;background:#007aff18;display:flex;align-items:center;justify-content:center;font-size:22px;color:var(--accent);z-index:200;pointer-events:none}
+#side{width:250px;flex:none;background:var(--side);border-right:1px solid var(--line);padding:14px 8px;overflow:auto}
+.lbl{display:flex;justify-content:space-between;align-items:center;color:var(--mute);font-size:11px;font-weight:600;padding:12px 8px 4px}
+.lbl button{border:0;background:none;color:var(--accent);font-size:18px;cursor:pointer;line-height:1}
+.row{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:8px;cursor:pointer;user-select:none}
+.row:hover{background:#0000000a}.row.sel{background:#007aff22}
+.cv{width:30px;height:30px;border-radius:6px;object-fit:cover;background:#dcdce1;flex:none}
+.nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.n{color:var(--mute);font-variant-numeric:tabular-nums}
+.act{display:none;gap:2px}.row:hover .act{display:flex}
+.act button{border:0;background:none;color:var(--mute);cursor:pointer;font-size:13px;padding:0 2px}
+#main{flex:1;min-width:0;display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line)}
+h1{font-size:17px;margin:0}
+#msg{color:var(--mute);flex:1}
+button.b{border:1px solid #d1d1d6;background:#fff;border-radius:7px;padding:5px 12px;font:inherit;cursor:pointer}
+button.b:hover{background:#f5f5f7}button.pri{background:var(--accent);border-color:var(--accent);color:#fff}button.pri:hover{background:#0a6fe0}
+details{border-bottom:1px solid var(--line);padding:8px 16px;background:#fafafc}
+summary{cursor:pointer;font-weight:600}
+#sheets{display:flex;gap:10px;overflow-x:auto;padding:8px 0}
+#sheets a{flex:none;width:110px;text-align:center;color:var(--ink);text-decoration:none;font-size:11px}
+#sheets img{width:110px;height:110px;object-fit:cover;border:1px solid var(--line);border-radius:6px;display:block}
+.ctl{display:flex;gap:8px;align-items:flex-start}
+textarea{flex:1;height:54px;border:1px solid #d1d1d6;border-radius:7px;padding:6px;font:12px ui-monospace,monospace;resize:vertical}
+#grid{flex:1;overflow:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:2px;align-content:start;padding:2px}
+.t{position:relative;aspect-ratio:1;background:#eee;overflow:hidden}
+.t img{width:100%;height:100%;object-fit:cover;display:block}
+.t i{position:absolute;right:6px;bottom:4px;color:#fff;font-style:normal;text-shadow:0 0 4px #000}
+.empty{grid-column:1/-1;text-align:center;color:var(--mute);padding:80px 0}
+</style>
+<body>
+<div id="side"></div>
+<div id="main">
+  <header>
+    <h1 id="title"></h1><span id="msg">把相片資料夾拖入視窗，或按「匯入資料夾」</span>
+    <button class="b" id="imp">匯入資料夾</button>
+    <button class="b pri" id="go">開始整理</button>
+    <button class="b" id="exp">匯出</button>
+  </header>
+  <details id="panel" open>
+    <summary>交給 Claude 分類</summary>
+    <div id="sheets">匯入後會在這裡出現編號總表圖</div>
+    <div class="ctl">
+      <button class="b" id="copy">複製分類指示</button>
+      <textarea id="json" placeholder='貼上 Claude 回覆的 JSON，例如 {"1": "美食", "2": "街景"}'></textarea>
+      <button class="b" id="apply">套用</button>
+    </div>
+  </details>
+  <div id="grid"></div>
+</div>
+<input type="file" id="pick" webkitdirectory multiple hidden>
+<script>
+const DUP='重複項目',SHOT='螢幕截圖',PEND='待整理',OTHER='其他';
+const IMG=/\.(jpe?g|png|webp|hei[cf])$/i,VID=/\.(mp4|mov|m4v)$/i,SHOTRE=/screenshot|screen ?shot|截圖/i;
+let albums=['人像','美食','咖啡與甜點','街景','景點','夜景','交通','購物','其他'];
+let items=[],pool=[],sheets=[],view=PEND,uid=0,busy=false;
+const $=s=>document.querySelector(s),sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const msg=t=>$('#msg').textContent=t;
+const allAlbums=()=>[...albums,SHOT,DUP];
+const cnt=a=>items.filter(i=>i.placed&&i.album===a).length;
+const ensureOther=()=>{if(!albums.includes(OTHER))albums.push(OTHER)};
+
+// ---------- 匯入 ----------
+async function walk(e,out){
+  if(e.isFile){out.push(await new Promise(r=>e.file(r,()=>r(null))));return}
+  const rd=e.createReader(),all=[];
+  for(;;){const b=await new Promise((ok,no)=>rd.readEntries(ok,no));if(!b.length)break;all.push(...b)}
+  for(const x of all)await walk(x,out);
+}
+const blobURL=c=>new Promise(r=>c.toBlob(b=>r(URL.createObjectURL(b)),'image/jpeg',.8));
+async function draw(bm){
+  const s=Math.min(1,320/Math.max(bm.width,bm.height)),c=document.createElement('canvas');
+  c.width=Math.max(1,bm.width*s|0);c.height=Math.max(1,bm.height*s|0);
+  c.getContext('2d').drawImage(bm,0,0,c.width,c.height);bm.close?.();return blobURL(c);
+}
+function placeholder(vid){
+  const c=document.createElement('canvas');c.width=c.height=320;const x=c.getContext('2d');
+  x.fillStyle='#ddd';x.fillRect(0,0,320,320);x.fillStyle='#888';x.font='80px sans-serif';x.textAlign='center';x.fillText(vid?'▶':'?',160,190);return blobURL(c);
+}
+function vidFrame(f){
+  return new Promise((ok,no)=>{
+    const v=document.createElement('video'),u=URL.createObjectURL(f);
+    v.muted=true;v.preload='auto';v.src=u;
+    const t=setTimeout(()=>no('timeout'),8000);
+    v.onerror=()=>no('err');
+    v.onloadeddata=()=>{v.currentTime=Math.min(0.1,v.duration/2||0)};
+    v.onseeked=async()=>{clearTimeout(t);try{ok(await createImageBitmap(v))}catch(e){no(e)}URL.revokeObjectURL(u)};
+  });
+}
+async function thumb(it){
+  try{
+    if(it.vid)return await draw(await vidFrame(it.file));
+    let b=it.file;
+    if(/\.hei[cf]$/i.test(b.name)){b=await heic2any({blob:b,toType:'image/jpeg',quality:.6});if(Array.isArray(b))b=b[0]}
+    return await draw(await createImageBitmap(b));
+  }catch(e){return placeholder(it.vid)}
+}
+// 大小 + 頭/中/尾各 64KB 抽樣的 SHA-1；shortcut: 抽樣之外有差異會漏判，要百分百準確需全檔比對
+async function hash(f){
+  const S=65536,m=Math.floor(f.size/2-S/2);
+  const parts=f.size<=3*S?[f]:[f.slice(0,S),f.slice(m,m+S),f.slice(f.size-S)];
+  const d=new Uint8Array(await crypto.subtle.digest('SHA-1',await new Blob(parts).arrayBuffer()));
+  return f.size+':'+[...d].map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+const seen=new Map();
+async function addFiles(files){
+  files=files.filter(f=>f&&(IMG.test(f.name)||VID.test(f.name))&&!f.name.startsWith('.'));
+  if(!files.length)return msg('找不到支援的相片或影片');
+  const fresh=[],q=[...files];let done=0;
+  await Promise.all([0,1,2,3].map(async()=>{
+    for(let f;f=q.shift();){
+      const it={id:++uid,file:f,name:f.name,vid:VID.test(f.name)};
+      [it.thumb,it.key]=await Promise.all([thumb(it),hash(f).catch(()=>null)]);
+      fresh.push(it);msg(`處理中 ${++done}/${files.length}`);
+    }
+  }));
+  fresh.sort((a,b)=>a.id-b.id);
+  for(const it of fresh){
+    if(it.key&&seen.has(it.key)){it.album=DUP;it.placed=true}
+    else{if(it.key)seen.set(it.key,it);if(SHOTRE.test(it.name)){it.album=SHOT;it.placed=true}}
+    items.push(it);
+  }
+  msg(`已匯入 ${fresh.length} 個檔案（重複 ${fresh.filter(i=>i.album===DUP).length}、截圖 ${fresh.filter(i=>i.album===SHOT).length}）`);
+  await buildSheets();render();
+}
+
+// ---------- 編號總表 ----------
+const loadImg=u=>new Promise(r=>{const i=new Image();i.onload=()=>r(i);i.src=u});
+async function buildSheets(){
+  sheets.forEach(s=>URL.revokeObjectURL(s.url));sheets=[];
+  pool=items.filter(i=>!i.placed);
+  const CELL=160,G=2;
+  for(let s=0;s<pool.length;s+=100){
+    const N=Math.min(100,pool.length-s),c=document.createElement('canvas');
+    c.width=10*(CELL+G)+G;c.height=Math.ceil(N/10)*(CELL+G)+G;
+    const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);
+    x.font='bold 22px sans-serif';x.textBaseline='middle';
+    for(let k=0;k<N;k++){
+      const im=await loadImg(pool[s+k].thumb),cx=G+(k%10)*(CELL+G),cy=G+Math.floor(k/10)*(CELL+G);
+      const r=Math.max(CELL/im.width,CELL/im.height),sw=CELL/r,sh=CELL/r;
+      x.drawImage(im,(im.width-sw)/2,(im.height-sh)/2,sw,sh,cx,cy,CELL,CELL);
+      const t=String(s+k+1),w=x.measureText(t).width+12;
+      x.fillStyle='#000c';x.fillRect(cx,cy,w,28);x.fillStyle='#fff';x.fillText(t,cx+6,cy+15);
+    }
+    sheets.push({url:await blobURL(c),from:s+1,to:s+N});
+  }
+  $('#sheets').innerHTML=sheets.length?sheets.map((s,i)=>`<a href="${s.url}" download="總表-${i+1}.jpg" title="按一下下載"><img src="${s.url}">總表 ${i+1}（${s.from}–${s.to}）↓</a>`).join(''):'冇需要分類嘅相片';
+}
+function instruction(){
+  const names=albums.join('、');
+  return `我會上載 ${sheets.length} 張編號總表圖（共 ${pool.length} 格，編號跨圖連續，每格左上角有編號）。請逐格睇相，把每個編號分入以下其中一個相簿：${names}。無法判斷的請分入「${OTHER}」。只回覆 JSON，不要加任何其他文字，格式：{"1": "美食", "2": "街景"}`;
+}
+$('#copy').onclick=async()=>{
+  try{await navigator.clipboard.writeText(instruction())}
+  catch{const t=document.createElement('textarea');t.value=instruction();document.body.append(t);t.select();document.execCommand('copy');t.remove()}
+  msg('已複製分類指示，連同總表圖貼給 Claude');
+};
+
+// ---------- 套用回覆 ----------
+function parseJSON(t){const a=t.indexOf('{'),b=t.lastIndexOf('}');if(a<0||b<a)throw 0;return JSON.parse(t.slice(a,b+1))}
+$('#apply').onclick=()=>{
+  let m;try{m=parseJSON($('#json').value)}catch{return msg('讀唔到 JSON，請檢查貼上嘅內容')}
+  ensureOther();let miss=0;
+  pool.forEach((it,i)=>{if(it.placed)return;const a=m[i+1];if(albums.includes(a))it.album=a;else{it.album=OTHER;miss++}});
+  document.activeElement.blur();msg(`已套用：${pool.length-miss} 張已分類，${miss} 張放入「${OTHER}」。按「開始整理」或 Return`);
+};
+
+// ---------- 整理動畫 ----------
+async function fly(it){
+  const t=document.querySelector(`.t[data-id="${it.id}"]`),
+        row=[...document.querySelectorAll('.row')].find(r=>r.dataset.album===it.album);
+  if(t&&row){
+    const a=t.getBoundingClientRect(),b=row.querySelector('.cv').getBoundingClientRect(),
+          c=t.querySelector('img').cloneNode();
+    Object.assign(c.style,{position:'fixed',left:a.left+'px',top:a.top+'px',width:a.width+'px',height:a.height+'px',objectFit:'cover',borderRadius:'4px',zIndex:99,pointerEvents:'none'});
+    document.body.append(c);t.remove();
+    await c.animate([{transform:'none',opacity:1},{transform:`translate(${b.left+b.width/2-a.left-a.width/2}px,${b.top+b.height/2-a.top-a.height/2}px) scale(${b.width/a.width})`,opacity:.7}],{duration:600,easing:'cubic-bezier(.4,0,.2,1)'}).finished;
+    c.remove();
+  }
+  it.placed=true;renderSide();head();
+  [...document.querySelectorAll('.row')].find(r=>r.dataset.album===it.album)?.querySelector('.n').animate([{transform:'scale(1)'},{transform:'scale(1.6)',color:'#007aff'},{transform:'scale(1)'}],{duration:300});
+}
+async function organize(){
+  if(busy)return;
+  const todo=items.filter(i=>!i.placed);
+  if(!todo.length)return msg('冇相片需要整理');
+  busy=true;ensureOther();view=PEND;render();
+  const gap=Math.min(80,2500/todo.length),fl=[];
+  for(const it of todo){it.album??=OTHER;fl.push(fly(it));await sleep(gap)}
+  await Promise.all(fl);busy=false;
+  render();msg('整理完成！');$('#panel').open=false;
+}
+$('#go').onclick=organize;
+addEventListener('keydown',e=>{if(e.key==='Enter'&&!/INPUT|TEXTAREA|BUTTON/.test(e.target.tagName))organize()});
+
+// ---------- 匯出 ----------
+async function freeName(d,name){
+  const m=name.match(/^(.*?)(\.[^.]*)?$/);
+  for(let k=0;;k++){const n=k?`${m[1]} (${k})${m[2]||''}`:name;try{await d.getFileHandle(n)}catch{return n}}
+}
+$('#exp').onclick=async()=>{
+  if(!window.showDirectoryPicker)return msg('匯出需要用 Chrome');
+  if(!items.length)return msg('未有相片');
+  let root;try{root=await showDirectoryPicker({mode:'readwrite'})}catch{return}
+  const dirs=new Map();let n=0;
+  try{
+    for(const it of items){
+      const a=(it.album||'未整理').replace(/[\\/:*?"<>|]/g,'_');
+      if(!dirs.has(a))dirs.set(a,await root.getDirectoryHandle(a,{create:true}));
+      const d=dirs.get(a),w=await(await d.getFileHandle(await freeName(d,it.name),{create:true})).createWritable();
+      await it.file.stream().pipeTo(w);msg(`匯出中 ${++n}/${items.length}`);
+    }
+    msg(`已匯出 ${n} 個檔案（原檔冇被改動）`);
+  }catch(e){msg('匯出失敗：'+e.message)}
+};
+
+// ---------- 介面 ----------
+function head(){
+  const n=view===PEND?items.filter(i=>!i.placed).length:cnt(view);
+  $('#title').textContent=`${view}（${n}）`;
+}
+function renderSide(){
+  const row=(a,n,cover,extra='')=>`<div class="row${a===view?' sel':''}" data-album="${a}"><${cover?`img class="cv" src="${cover.thumb}"`:'span class="cv"'}${cover?'>':'></span>'}<span class="nm">${a}</span><span class="act">${extra}</span><span class="n">${n}</span></div>`;
+  const cover=a=>items.find(i=>i.placed&&i.album===a);
+  const un=items.filter(i=>!i.placed).length;
+  $('#side').innerHTML=row(PEND,un,null)
+    +`<div class="lbl">相簿<button id="add" title="新增相簿">＋</button></div>`
+    +albums.map(a=>row(a,cnt(a),cover(a),a===OTHER?'':'<button data-a="ren">✎</button><button data-a="del">✕</button>')).join('')
+    +`<div class="lbl">自動分開</div>`+[SHOT,DUP].map(a=>row(a,cnt(a),cover(a))).join('');
+}
+function renderGrid(){
+  const list=items.filter(i=>view===PEND?!i.placed:i.placed&&i.album===view);
+  $('#grid').innerHTML=list.length?list.map(i=>`<div class="t" data-id="${i.id}" title="${i.name.replace(/"/g,'&quot;')}"><img src="${i.thumb}" loading="lazy">${i.vid?'<i>▶</i>':''}</div>`).join(''):`<div class="empty">${items.length?'呢個相簿暫時冇相片':'拖入相片資料夾開始'}</div>`;
+}
+function render(){renderSide();renderGrid();head()}
+$('#side').onclick=e=>{
+  if(busy)return;
+  if(e.target.id==='add'){
+    const n=prompt('新相簿名稱')?.trim();
+    if(!n)return;if(allAlbums().includes(n)||n===PEND)return msg('已有同名相簿');
+    albums.splice(albums.includes(OTHER)?albums.indexOf(OTHER):albums.length,0,n);return render();
+  }
+  const r=e.target.closest('.row');if(!r)return;const a=r.dataset.album,act=e.target.dataset.a;
+  if(act==='ren'){
+    const n=prompt('相簿新名稱',a)?.trim();
+    if(!n||n===a)return;if(allAlbums().includes(n)||n===PEND)return msg('已有同名相簿');
+    albums[albums.indexOf(a)]=n;items.forEach(i=>{if(i.album===a)i.album=n});if(view===a)view=n;
+  }else if(act==='del'){
+    if(!confirm(`刪除相簿「${a}」？裡面嘅相片會移到「${OTHER}」`))return;
+    albums.splice(albums.indexOf(a),1);ensureOther();items.forEach(i=>{if(i.album===a)i.album=OTHER});if(view===a)view=PEND;
+  }else view=a;
+  render();
+};
+$('#imp').onclick=()=>$('#pick').click();
+$('#pick').onchange=e=>{addFiles([...e.target.files]);e.target.value=''};
+addEventListener('dragover',e=>{e.preventDefault();document.body.classList.add('drag')});
+addEventListener('dragleave',e=>{if(!e.relatedTarget)document.body.classList.remove('drag')});
+addEventListener('drop',async e=>{
+  e.preventDefault();document.body.classList.remove('drag');
+  const es=[...e.dataTransfer.items].map(i=>i.webkitGetAsEntry?.()).filter(Boolean),fs=[]; // 要同步攞，await 後 items 會失效
+  for(const x of es)await walk(x,fs);addFiles(fs);
+});
+render();
+</script>
